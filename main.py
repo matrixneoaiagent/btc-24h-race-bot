@@ -1,9 +1,9 @@
 """cbBTC 1-minute trading bot for the make.fun btc-race-24h competition.
 
-Long only, one position at a time, all cash per entry. The regime is the
-EMA(60) above the EMA(240) of the bar close; entries happen only on the first
-bar of an up regime, and exits are a trailing stop, a hard stop, or the
-regime turning down.
+Long only, one position at a time, all cash per entry. The regime is EMA(60)
+above EMA(240) of the bar close: enter on a fresh up cross and take half the
+position off at +0.70%, then trail the rest; a -0.60% hard stop or the regime
+turning down closes whatever is left. Cash the rest of the time.
 """
 
 import os
@@ -24,6 +24,10 @@ MAX_SLIPPAGE_BPS = 300
 TRAIL_ARM = 0.0040
 TRAIL_GAP = 0.0035
 STOP_LOSS = -0.0060
+# Take half off here, then trail the remainder more loosely.
+PARTIAL_AT = 0.0070
+PARTIAL_FRACTION = 0.5
+PARTIAL_GAP = 0.0050
 
 
 class Ema:
@@ -49,6 +53,9 @@ _slow = Ema(SLOW_SPAN)
 _entered = False
 _pending_buy = False
 _peak_ratio = None
+_partial_done = False
+_traded = False
+_min_trade_units = 2_000_000  # 2 USDC: the participation trade if no regime entry came
 
 
 def _cbbtc_bar(batch):
@@ -61,20 +68,26 @@ def _cbbtc_bar(batch):
 
 
 def _apply_fills(batch):
-    """Fold the previous reply's fills into the latch and peak state."""
-    global _entered, _pending_buy, _peak_ratio
+    """Fold the previous reply's fills into the latch, peak and partial state."""
+    global _entered, _pending_buy, _peak_ratio, _partial_done, _traded
     for fill in batch["fills"]:
         if fill["symbol"] != SYMBOL:
             continue
         if fill["status"] == "filled":
-            # A filled buy opens a fresh peak; a filled sell closes the old one.
+            # A filled buy opens a fresh peak; a filled sell closes or trims it.
             _peak_ratio = None
             if fill["side"] == "buy":
                 _pending_buy = False
+                _partial_done = False
+                _traded = True
         elif fill["side"] == "buy" and _pending_buy:
             # The market refused the entry: a later bar may try again.
             _pending_buy = False
             _entered = False
+        elif fill["side"] == "sell" and _partial_done:
+            # The partial was refused (max_slippage); keep the whole position
+            # and try the trim again on a later bar.
+            _partial_done = False
 
 
 def _mark_ratio(state, held):
@@ -95,18 +108,23 @@ def _buy_order(cash):
     }
 
 
-def _sell_order(held):
+def _sell_order(qty):
     return {
         "side": "sell",
         "symbol": SYMBOL,
-        "qty": held.qty,
+        "qty": qty,
         "max_slippage_bps": MAX_SLIPPAGE_BPS,
     }
 
 
+def _min_notional(state):
+    """The venue's smallest entry, in quote units."""
+    return int(state.hello["fees"]["min_notional_quote_units"])
+
+
 def on_batch(state, batch):
     """Answer one minute's bar with at most one order."""
-    global _entered, _pending_buy
+    global _entered, _pending_buy, _partial_done
 
     _apply_fills(batch)
     bar = _cbbtc_bar(batch)
@@ -122,17 +140,33 @@ def on_batch(state, batch):
     held = state.positions.get(SYMBOL)
     if held is not None and held.cost > 0:
         ratio = _mark_ratio(state, held)
-        trailing = _peak_ratio >= TRAIL_ARM and ratio <= _peak_ratio - TRAIL_GAP
-        if trailing or ratio <= STOP_LOSS or fast < slow:
-            return [_sell_order(held)]
+        # Once half is banked at +0.70%, the rest may not turn the trade into
+        # a loser: its stop moves to +0.10% over cost.
+        stop = 0.0010 if _partial_done else STOP_LOSS
+        if ratio <= stop or fast < slow:
+            return [_sell_order(held.qty)]
+        if not _partial_done and _peak_ratio >= PARTIAL_AT:
+            trim = held.qty // 2
+            if trim > 0:
+                _partial_done = True
+                return [_sell_order(trim)]
+        gap = PARTIAL_GAP if _partial_done else TRAIL_GAP
+        if _peak_ratio >= TRAIL_ARM and ratio <= _peak_ratio - gap:
+            return [_sell_order(held.qty)]
         return []
 
-    if fast > slow and not _entered and not _pending_buy:
+    if not _pending_buy:
         cash = state.cash
-        if cash >= int(state.hello["fees"]["min_notional_quote_units"]):
-            _entered = True
+        if fast > slow and not _entered:
+            if cash >= _min_notional(state):
+                _entered = True
+                _pending_buy = True
+                return [_buy_order(cash)]
+        elif not _traded and batch["seq"] >= 1200 and cash >= _min_trade_units:
+            # No regime entry all window: a token long keeps the entry in the
+            # contest's guardrail (at least one trade) without betting the book.
             _pending_buy = True
-            return [_buy_order(cash)]
+            return [_buy_order(_min_trade_units)]
     return []
 
 
