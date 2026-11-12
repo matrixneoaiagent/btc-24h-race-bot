@@ -28,6 +28,9 @@ STOP_LOSS = -0.0060
 PARTIAL_AT = 0.0070
 PARTIAL_FRACTION = 0.5
 PARTIAL_GAP = 0.0050
+# Enter only when the fast EMA is at least this far above the slow one: a
+# 10 bp gap is a trend, not the noise around a flat pair.
+TREND_GAP = 0.0010
 
 
 class Ema:
@@ -122,6 +125,11 @@ def _min_notional(state):
     return int(state.hello["fees"]["min_notional_quote_units"])
 
 
+def _trend_gap(fast, slow, close):
+    """The fast-over-slow EMA gap as a fraction of the close; 0 if close is 0."""
+    return (fast - slow) / float(close) if close else 0.0
+
+
 def on_batch(state, batch):
     """Answer one minute's bar with at most one order."""
     global _entered, _pending_buy, _partial_done
@@ -157,7 +165,8 @@ def on_batch(state, batch):
 
     if not _pending_buy:
         cash = state.cash
-        if fast > slow and not _entered:
+        gap = _trend_gap(fast, slow, bar["c"])
+        if fast > slow and gap >= TREND_GAP and not _entered:
             if cash >= _min_notional(state):
                 _entered = True
                 _pending_buy = True
